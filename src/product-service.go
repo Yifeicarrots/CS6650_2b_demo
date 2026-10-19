@@ -10,14 +10,81 @@ package main
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// ===================== Observability: RED metrics =====================
+
+// Labels use the route template (e.g. /products/:productId), not the raw
+// path, so every product ID shares one time series instead of creating one
+// per ID (which would blow up Prometheus's memory, "high cardinality").
+var (
+	// Rate: total requests, counted per method, route, and status code.
+	requestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "http_requests_total",
+		Help: "Total HTTP requests handled.",
+	}, []string{"method", "route", "status"})
+
+	// Errors: requests that returned a non-2xx status code.
+	errorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "http_request_errors_total",
+		Help: "Total HTTP requests that returned a non-2xx status.",
+	}, []string{"method", "route", "status"})
+
+	// Duration: latency histogram. Buckets range from 0.1 ms to ~3.3 s,
+	// because this in-memory server often answers in well under 1 ms.
+	requestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "http_request_duration_seconds",
+		Help:    "HTTP request latency in seconds.",
+		Buckets: prometheus.ExponentialBuckets(0.0001, 2, 16),
+	}, []string{"method", "route"})
+)
+
+// observability runs around every request: it times the request, then
+// records the RED metrics and writes one structured JSON log line.
+func observability(logger *slog.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		c.Next() // run the rest of the chain (recovery + the handler)
+
+		route := c.FullPath() // route template; "" if no route matched
+		if route == "" {
+			route = "unmatched"
+		}
+		if route == "/metrics" {
+			return // don't measure Prometheus's own scrapes
+		}
+
+		status := c.Writer.Status()
+		statusLabel := strconv.Itoa(status)
+		duration := time.Since(start)
+
+		requestsTotal.WithLabelValues(c.Request.Method, route, statusLabel).Inc()
+		if status < 200 || status >= 300 {
+			errorsTotal.WithLabelValues(c.Request.Method, route, statusLabel).Inc()
+		}
+		requestDuration.WithLabelValues(c.Request.Method, route).Observe(duration.Seconds())
+
+		logger.Info("request",
+			"method", c.Request.Method,
+			"route", route,
+			"path", c.Request.URL.Path,
+			"status", status,
+			"duration_ms", float64(duration.Microseconds())/1000.0,
+		)
+	}
+}
 
 // ===================== Data types (components/schemas) =====================
 
@@ -220,10 +287,16 @@ func (h *ProductHandler) AddProductDetails(c *gin.Context) {
 // ===================== Server setup =====================
 
 func main() {
+	// Structured JSON logs to stdout (one JSON object per line).
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
 	handler := &ProductHandler{store: NewProductStore()}
 
 	router := gin.New()
-	router.Use(gin.Logger())
+
+	// Registered first so it wraps everything, including recovery:
+	// a request that panics is still measured and logged as a 500.
+	router.Use(observability(logger))
 
 	// If any handler panics, return a 500 with an Error-schema body
 	// instead of crashing the server.
@@ -239,9 +312,13 @@ func main() {
 	router.GET("/products/:productId", handler.GetProduct)
 	router.POST("/products/:productId/details", handler.AddProductDetails)
 
+	// Prometheus scrapes this endpoint to collect the metrics above.
+	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
+
 	// ":8080" listens on all network interfaces, which Docker needs.
-	log.Println("Product service listening on :8080")
+	logger.Info("Product service listening", "addr", ":8080")
 	if err := router.Run(":8080"); err != nil {
-		log.Fatal(err)
+		logger.Error("server stopped", "error", err)
+		os.Exit(1)
 	}
 }

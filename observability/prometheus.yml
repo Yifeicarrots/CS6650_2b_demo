@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 5s   # how often Prometheus pulls /metrics
+
+scrape_configs:
+  - job_name: product-service
+    static_configs:
+      # "app" is the service name in docker-compose.yml; Docker's
+      # internal DNS resolves it to the app container.
+      - targets: ["app:8080"]

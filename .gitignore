@@ -2,3 +2,9 @@
 **.tfstate
 **.tfstate.*
 **/.terraform/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.env
+__pycache__/
