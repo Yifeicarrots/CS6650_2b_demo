@@ -2,11 +2,11 @@
 terraform {
   required_providers {
     aws = {
-      source  = "hashicorp/aws"
+      source  = "hashicorp/aws" # creating AWS resources
       version = "~> 6.7.0"
     }
     docker = {
-      source  = "kreuzwerker/docker"
+      source  = "kreuzwerker/docker" # building and pushing Docker images
       version = "~> 2.0"
     }
   }
